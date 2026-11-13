@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from dataclasses import replace
 from html import unescape, escape
@@ -13,11 +14,25 @@ from urllib.parse import quote
 import httpx
 from .models import Room, Reading, QueryError, number, building_name, shapingba_building
 
+BEIJING = timezone(timedelta(hours=8))
 HOST = "payment.cqu.edu.cn"
-SENSITIVE = {"token", "accesstoken", "refreshtoken", "authorization", "synjonesauth", "cookie", "setcookie", "password", "secret", "appsecret"}
+NH_HOST = "nh.cqu.edu.cn:26989"
+SENSITIVE = {
+    "token", "accesstoken", "refreshtoken", "authorization", "synjonesauth", "cookie", "setcookie", "password", "secret", "appsecret",
+    "fusername", "username", "faddr", "addr", "fidno", "idno", "fcellphone", "cellphone", "phone", "mobile",
+    "fsalaryacct", "salaryacct", "fhomephone", "homephone", "fidname", "idname", "idcard", "realname",
+    "fdept", "dept", "fdeptname", "deptname", "fmemo", "memo",
+}
+
+NH_ACCOUNT_ALLOWED = {
+    "f_acctid", "f_buildingid", "pointername", "f_opendate", "f_opendatestr", "f_closedate",
+    "f_openstate", "f_initbalance", "f_initallowance", "f_notifytimes", "f_order", "f_prepay",
+    "f_acctname", "f_acctpy", "b_f_totalace", "b_f_totaldegree", "b_f_initallowance",
+    "b_f_initbalance", "b_f_balancedegree", "eprid", "eprname", "f_accttype", "f_accttypent",
+}
 
 
-def redact_body(body, token):
+def redact_body(body, token, stage=None):
     # Preserve response bytes when no secret is present. Never store request headers.
     target_values = {token, quote(token, safe=""), escape(token)} - {""}
     for value in target_values:
@@ -25,21 +40,26 @@ def redact_body(body, token):
     try:
         value = json.loads(body)
     except (ValueError, UnicodeError):
-        return re.sub(rb'(?i)((?:access_token|refresh_token|password|authorization|synjones-auth)[\s"\']*[:=][\s"\']*)([^"\'<>\s,}]+)', rb'\1[REDACTED]', body)
+        return re.sub(rb'(?i)((?:access_token|refresh_token|password|authorization|synjones-auth|f_username|f_addr|f_idno|f_cellphone|f_salaryacct|f_homephone)[\s"\']*[:=][\s"\']*)([^"\'<>\s,}]+)', rb'\1[REDACTED]', body)
     changed = False
-    def clean(item):
+    def clean(item, is_account_stage=False):
         nonlocal changed
         if isinstance(item, dict):
             result = {}
             for key, val in item.items():
-                if re.sub(r"[^a-z]", "", key.lower()) in SENSITIVE:
+                norm = re.sub(r"[^a-z0-9_]", "", key.lower())
+                norm_az = re.sub(r"[^a-z]", "", key.lower())
+                if is_account_stage and norm not in NH_ACCOUNT_ALLOWED:
+                    result[key] = "[REDACTED]"
+                    changed = True
+                elif norm_az in SENSITIVE:
                     result[key] = "[REDACTED]"
                     changed = True
                 else:
-                    result[key] = clean(val)
+                    result[key] = clean(val, is_account_stage)
             return result
         if isinstance(item, list):
-            return [clean(v) for v in item]
+            return [clean(v, is_account_stage) for v in item]
         if isinstance(item, str):
             res_str = item
             for tv in target_values:
@@ -48,7 +68,7 @@ def redact_body(body, token):
                     changed = True
             return res_str
         return item
-    cleaned = clean(value)
+    cleaned = clean(value, is_account_stage=(stage == "nh_account"))
     return json.dumps(cleaned, ensure_ascii=False).encode() if changed else body
 
 
@@ -141,42 +161,232 @@ def parse_reading(room, response_map, price):
         raise QueryError("PARSE_ERROR") from None
 
 
+def parse_nh_reading(room, acct_data, sacct_data, default_price=Decimal("0.54"), debils_data=None, gour_data=None, now_bj=None):
+    if not isinstance(acct_data, list) or not acct_data:
+        raise QueryError("INVALID_RESPONSE")
+    acct = acct_data[0]
+    if not isinstance(acct, dict):
+        raise QueryError("INVALID_RESPONSE")
+    acct_name = str(acct.get("F_AcctName") or "").strip().upper()
+    if acct_name and acct_name != room.room_number:
+        raise QueryError("ROOM_MISMATCH")
+    try:
+        cash = number(acct.get("B_F_InitBalance"))
+        subsidy = number(acct.get("B_F_InitAllowance", 0))
+    except (ValueError, TypeError):
+        raise QueryError("PARSE_ERROR") from None
+
+    aa_data = sacct_data.get("aaData") if isinstance(sacct_data, dict) else None
+    meter_reading = None
+    unit_price = default_price
+    building_raw = str(acct.get("PointerName") or "")
+
+    if isinstance(aa_data, list) and aa_data:
+        row = aa_data[0]
+        if isinstance(row, list):
+            try:
+                if len(row) > 10 and row[10] not in (None, ""):
+                    unit_price = number(row[10])
+                if len(row) > 14 and row[14] not in (None, ""):
+                    meter_reading = number(row[14])
+                if len(row) > 16 and row[16] not in (None, ""):
+                    building_raw = str(row[16])
+            except (ValueError, TypeError):
+                raise QueryError("PARSE_ERROR") from None
+
+    monthly_kwh, monthly_cost_yuan, monthly_name = None, None, None
+    if isinstance(debils_data, dict):
+        dbs = debils_data.get("dbs")
+        if isinstance(dbs, list) and dbs:
+            last_db = dbs[-1]
+            if isinstance(last_db, dict):
+                try:
+                    if last_db.get("F_UsedDegree") not in (None, ""):
+                        monthly_kwh = number(last_db.get("F_UsedDegree"))
+                    if last_db.get("F_TotalPrice") not in (None, ""):
+                        monthly_cost_yuan = number(last_db.get("F_TotalPrice"))
+                    if last_db.get("F_Month") not in (None, ""):
+                        monthly_name = str(last_db.get("F_Month")).strip()
+                except (ValueError, TypeError):
+                    monthly_kwh, monthly_cost_yuan, monthly_name = None, None, None
+
+    today_kwh, today_cost_yuan, today_point = None, None, None
+    if isinstance(gour_data, dict):
+        gour_rows = gour_data.get("aaData")
+        if isinstance(gour_rows, list):
+            if now_bj is None:
+                now_bj = datetime.now(BEIJING)
+            today_slash = now_bj.strftime("%Y/%m/%d")
+            today_dash = now_bj.strftime("%Y-%m-%d")
+            today_rows = [
+                row for row in gour_rows
+                if isinstance(row, list) and len(row) > 6 and (str(row[0]).startswith(today_slash) or str(row[0]).startswith(today_dash))
+            ]
+            if today_rows:
+                try:
+                    today_kwh = sum((number(r[4]) for r in today_rows if r[4] not in (None, "")), Decimal(0))
+                    today_cost_yuan = sum((number(r[6]) for r in today_rows if r[6] not in (None, "")), Decimal(0))
+                    last_t = str(today_rows[-1][0]).strip()
+                    today_point = last_t.split()[-1] if " " in last_t else last_t
+                except (ValueError, TypeError):
+                    today_kwh, today_cost_yuan, today_point = None, None, None
+
+    id_info = shapingba_building(building_raw) or shapingba_building(room.building)
+    resolved = f"{id_info[0]}区{id_info[1]}舍" if id_info else room.building
+    return Reading(
+        cash_balance_yuan=cash,
+        subsidy_balance_yuan=subsidy,
+        meter_reading_kwh=meter_reading,
+        unit_price_yuan=unit_price,
+        resolved_building=resolved,
+        today_kwh=today_kwh,
+        today_cost_yuan=today_cost_yuan,
+        today_point=today_point,
+        monthly_kwh=monthly_kwh,
+        monthly_cost_yuan=monthly_cost_yuan,
+        monthly_name=monthly_name,
+    )
+
+
 class ElectricityClient:
-    def __init__(self, token_path, *, session="", scheme="https", timeout=40, price="0.54", transport=None):
+    def __init__(self, token_path, *, session="", scheme="https", timeout=40, price="0.54", transport=None,
+                 nh_enabled=False, nh_host=NH_HOST, nh_scheme="http"):
         if scheme not in {"http", "https"}: raise ValueError("Invalid scheme")
+        if nh_scheme not in {"http", "https"}: raise ValueError("Invalid scheme")
         self.token_path, self.scheme = token_path, scheme
         self.session = session
         self.timeout, self.price = max(1,min(float(timeout),90)), number(price)
         if self.price <= 0: raise ValueError("Invalid price")
         self.transport = transport
+        self.nh_enabled = bool(nh_enabled)
+        self.nh_host = nh_host.strip()
+        self.nh_scheme = nh_scheme.strip()
 
-    def configured(self):
-        try: load_token(self.token_path, self.session); return True
-        except QueryError: return False
+    def configured(self, campus=None):
+        if campus == "shapingba" and self.nh_enabled:
+            return True
+        try:
+            load_token(self.token_path, self.session)
+            return True
+        except QueryError:
+            return False
+
+    async def _fetch_shapingba_nh(self, room, record):
+        url_base = f"{self.nh_scheme}://{self.nh_host}"
+        headers = {"User-Agent": "AstrBot-CQU-Electricity/0.1.7"}
+        try:
+            async with httpx.AsyncClient(headers=headers, timeout=min(15, self.timeout), follow_redirects=False, transport=self.transport) as http:
+                async def request(stage, method, path, *, data=None, params=None, req_timeout=None):
+                    t = req_timeout or min(15.0, self.timeout)
+                    async with http.stream(method, f"{url_base}{path}", data=data, params=params, timeout=t) as response:
+                        chunks, size = [], 0
+                        async for chunk in response.aiter_bytes():
+                            chunks.append(chunk)
+                            size += len(chunk)
+                            if size > 2 * 1024 * 1024:
+                                record(stage, response.status_code, response.headers.get("content-type", ""), redact_body(b"".join(chunks), "", stage=stage))
+                                raise QueryError("RESPONSE_TOO_LARGE")
+                        body = b"".join(chunks)
+                        record(stage, response.status_code, response.headers.get("content-type", ""), redact_body(body, "", stage=stage))
+                        if response.status_code >= 400:
+                            raise QueryError("HTTP_ERROR")
+                        try:
+                            return json.loads(body)
+                        except (ValueError, UnicodeError):
+                            raise QueryError("INVALID_RESPONSE") from None
+
+                # Core data: login, account balance, and device meter reading.
+                # Strictly guarded by self.timeout.
+                async with asyncio.timeout(self.timeout):
+                    login_data = await request("nh_login", "POST", "/df/Admin/Login", data={"username": room.room_number})
+                    if not isinstance(login_data, dict):
+                        raise QueryError("INVALID_RESPONSE")
+                    if str(login_data.get("code")) == "-3":
+                        raise QueryError("ROOM_NOT_FOUND")
+                    if str(login_data.get("code")) != "0":
+                        raise QueryError("INVALID_RESPONSE")
+                    acct_id = str(login_data.get("SysLoginAcctID") or "").strip()
+                    if not acct_id:
+                        raise QueryError("INVALID_RESPONSE")
+
+                    acct_data = await request("nh_account", "GET", "/df/Home/GetAcctDs", params={"SysLoginAcctID": acct_id})
+                    sacct_data = await request("nh_device", "GET", "/df/Home/GetSAcctDs", params={"sEcho": 1, "iDisplayStart": 0, "iDisplayLength": 30, "sSearch": acct_id})
+
+                # Core data is now secured. Optional stats (debils, 48h) run with an isolated,
+                # short timeout budget (3.0s each). Any timeout or error in optional endpoints
+                # must never drop or fail the already-successful base reading.
+                debils_data, gour_data = None, None
+                try:
+                    async with asyncio.timeout(3.0):
+                        debils_data = await request("nh_debils", "GET", "/df/Home/GetDeBils", params={"SysLoginAcctID": acct_id}, req_timeout=3.0)
+                except (TimeoutError, httpx.TimeoutException, QueryError, Exception):
+                    debils_data = None
+
+                try:
+                    async with asyncio.timeout(3.0):
+                        gour_data = await request("nh_48h", "GET", "/df/Home/Get48GourDs", params={"sEcho": 1, "iDisplayStart": 0, "iDisplayLength": 200, "sSearch": acct_id}, req_timeout=3.0)
+                except (TimeoutError, httpx.TimeoutException, QueryError, Exception):
+                    gour_data = None
+
+                return parse_nh_reading(room, acct_data, sacct_data, self.price, debils_data=debils_data, gour_data=gour_data)
+        except QueryError:
+            raise
+        except (TimeoutError, httpx.TimeoutException):
+            raise QueryError("TIMEOUT") from None
+        except httpx.HTTPError:
+            raise QueryError("NETWORK") from None
+        except (ValueError, TypeError, KeyError, AttributeError):
+            raise QueryError("INVALID_RESPONSE") from None
 
     async def fetch(self, room, save_response):
+        seq = 0
+        def record(stage, status, content_type, body):
+            nonlocal seq
+            seq += 1
+            save_response(seq, stage, status, content_type, body)
+
+        if room.campus == "shapingba" and self.nh_enabled:
+            try:
+                return await self._fetch_shapingba_nh(room, record)
+            except QueryError as exc:
+                if self.configured() and exc.code not in {"ROOM_NOT_FOUND", "RESPONSE_TOO_LARGE", "ROOM_MISMATCH"}:
+                    pass
+                else:
+                    raise
+            except (TimeoutError, httpx.TimeoutException):
+                if self.configured():
+                    pass
+                else:
+                    raise QueryError("TIMEOUT") from None
+            except httpx.HTTPError:
+                if self.configured():
+                    pass
+                else:
+                    raise QueryError("NETWORK") from None
+            except Exception:
+                if self.configured():
+                    pass
+                else:
+                    raise QueryError("INVALID_RESPONSE") from None
+
         token = load_token(self.token_path, self.session)
         authorization = "bearer " + token
         headers = {"synjones-auth":authorization,"Authorization":"Basic Y2hhcmdlOmNoYXJnZV9zZWNyZXQ=", "User-Agent":"AstrBot-CQU-Electricity/0.1.7"}
         cookies = httpx.Cookies()
         cookies.set("synjones-auth",authorization,domain=HOST,path="/charge")
-        seq = 0
         try:
             async with asyncio.timeout(self.timeout):
                 async with httpx.AsyncClient(headers=headers,cookies=cookies,timeout=min(15,self.timeout),follow_redirects=False,transport=self.transport) as http:
                     async def request(stage, form):
-                        nonlocal seq
                         async with http.stream("POST",f"{self.scheme}://{HOST}/charge/feeitem/getThirdData",data=form) as response:
                             chunks, size = [], 0
                             async for chunk in response.aiter_bytes():
                                 chunks.append(chunk); size += len(chunk)
                                 if size > 2 * 1024 * 1024:
-                                    seq += 1
-                                    save_response(seq,stage,response.status_code,response.headers.get("content-type",""),redact_body(b"".join(chunks),token))
+                                    record(stage,response.status_code,response.headers.get("content-type",""),redact_body(b"".join(chunks),token))
                                     raise QueryError("RESPONSE_TOO_LARGE")
                             body = b"".join(chunks)
-                            seq += 1
-                            save_response(seq,stage,response.status_code,response.headers.get("content-type",""),redact_body(body,token))
+                            record(stage,response.status_code,response.headers.get("content-type",""),redact_body(body,token))
                             if response.status_code in (401,403) or 300 <= response.status_code < 400:
                                 raise QueryError("AUTH_EXPIRED")
                             if response.status_code >= 400: raise QueryError("HTTP_ERROR")

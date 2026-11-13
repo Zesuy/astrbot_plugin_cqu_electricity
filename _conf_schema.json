@@ -72,5 +72,15 @@
     "type": "bool",
     "description": "允许 QQ 私聊电费命令；不放开其他私聊消息的全局白名单",
     "default": true
+  },
+  "shapingba_nh_enabled": {
+    "type": "bool",
+    "description": "沙坪坝校区使用能源系统免密查询（支持电表累计读数）；关闭后回退至缴费平台",
+    "default": true
+  },
+  "shapingba_nh_host": {
+    "type": "string",
+    "description": "沙坪坝校区能源系统地址与端口",
+    "default": "nh.cqu.edu.cn:26989"
   }
 }

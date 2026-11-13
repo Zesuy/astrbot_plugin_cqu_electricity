@@ -52,9 +52,23 @@ class Scheduler:
         async with self.lock:
             await self._tick(now)
 
+    def _is_client_configured(self, campus):
+        client = getattr(self.service, "client", None)
+        if client is None:
+            return True
+        configured_fn = getattr(client, "configured", None)
+        if not callable(configured_fn):
+            return True
+        try:
+            return bool(configured_fn(campus))
+        except TypeError:
+            return bool(configured_fn())
+
     def _eligible_rooms(self):
         rooms={}
         for room in self.repo.monitored_rooms():
+            if not self._is_client_configured(room.get("campus")):
+                continue
             bindings=self.repo.all("SELECT * FROM user_bindings WHERE room_id=?",(room["id"],))
             if any((self.allowed(b["platform_id"],b["group_id"],b["origin"]) or self.allowed(b["platform_id"],"",self.repo.route(b["platform_id"],"",b["user_id"]))) for b in bindings):
                 rooms[room["id"]]=room
@@ -101,8 +115,9 @@ class Scheduler:
         now=(now or datetime.now(BEIJING)).astimezone(BEIJING)
         day=now.date().isoformat()
         self.next_delay=60
-        if not self.service.client.configured(): return
         rooms=self._eligible_rooms()
+        if not rooms:
+            return
         for hour,minute in self.capture_times:
             due=now.replace(hour=hour,minute=minute,second=0,microsecond=0)
             slot=f"{hour:02d}:{minute:02d}"

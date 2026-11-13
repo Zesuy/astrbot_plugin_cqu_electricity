@@ -5,7 +5,7 @@ from decimal import Decimal
 from .models import ERRORS
 
 BEIJING = timezone(timedelta(hours=8))
-PUBLIC_FIELDS = ("finished_at","cash_balance_yuan","subsidy_kwh","subsidy_balance_yuan","total_balance_yuan","meter_reading_kwh","unit_price_yuan")
+PUBLIC_FIELDS = ("finished_at","cash_balance_yuan","subsidy_kwh","subsidy_balance_yuan","total_balance_yuan","meter_reading_kwh","unit_price_yuan","today_kwh","today_cost_yuan","today_point","monthly_kwh","monthly_cost_yuan","monthly_name")
 
 
 def local_time(value):
@@ -33,6 +33,42 @@ def public_result(room, current, previous=None, *, cached=False, error=None):
     return {"ok":bool(current) and not error,"room":{"campus":room["campus"],"building":room["building"],"room_number":room["room_number"]},"reading":public_record(current) if current else None,"usage":usage(current,previous) if current else None,"cached":cached,"stale":bool(error and current),"error_code":error,"message":ERRORS.get(error) if error else None,"timezone":"Asia/Shanghai","currency":"CNY"}
 
 
+def energy_stats_lines(reading, now=None):
+    if reading.get("today_kwh") is None and reading.get("monthly_kwh") is None:
+        return []
+    now_bj = (now or datetime.now(BEIJING)).astimezone(BEIJING)
+    lines = ["", "📊 用电统计："]
+    if reading.get("today_kwh") is not None:
+        finished_at = reading.get("finished_at")
+        is_today = True
+        finished_dt = None
+        if finished_at:
+            try:
+                finished_dt = datetime.fromisoformat(finished_at).astimezone(BEIJING)
+                is_today = (finished_dt.date() == now_bj.date())
+            except Exception:
+                is_today = True
+
+        point_str = reading.get("today_point", "当前")
+        cost_str = f" · 约 {Decimal(reading['today_cost_yuan']):.2f} 元" if reading.get("today_cost_yuan") is not None else ""
+        if is_today:
+            lines += [f"今日用量：约 {Decimal(reading['today_kwh']):.2f} 度（今日零点至 {point_str}）{cost_str}"]
+        else:
+            day_str = finished_dt.strftime("%m月%d日") if finished_dt else "记录日"
+            lines += [f"{day_str}用量：约 {Decimal(reading['today_kwh']):.2f} 度（{day_str}零点至 {point_str}）{cost_str}"]
+
+    if reading.get("monthly_kwh") is not None:
+        m_name = str(reading.get("monthly_name") or "").strip()
+        curr_m1 = now_bj.strftime("%Y年%m月")
+        curr_m2 = f"{now_bj.year}年{now_bj.month}月"
+        is_curr_m = bool(m_name and (m_name == curr_m1 or m_name == curr_m2))
+        month_prefix = "本月累计" if is_curr_m else "最近账单"
+        month_label = f"（{m_name}）" if m_name else ""
+        cost_str = f" · 电费 {Decimal(reading['monthly_cost_yuan']):.2f} 元" if reading.get("monthly_cost_yuan") is not None else ""
+        lines += [f"{month_prefix}：{Decimal(reading['monthly_kwh']):.2f} 度{cost_str}{month_label}"]
+    return lines
+
+
 def summary(result, *, detail=False):
     if "daily_brief" in result: return daily_brief_text(result,detail=detail)
     room=result["room"]
@@ -57,6 +93,7 @@ def summary(result, *, detail=False):
     if detail:
         if reading.get("meter_reading_kwh") is not None: lines += ["累计电表读数："+fmt(reading["meter_reading_kwh"])+" 度"]
         lines += ["电价："+fmt(reading["unit_price_yuan"])+" 元/度", "校区："+{"huxi":"虎溪","shapingba":"沙坪坝"}[room["campus"]]]
+        lines += energy_stats_lines(reading)
         if delta and not delta.get("available"): lines += [delta.get("reason", "用量暂不可用")]
     label="上次成功" if result.get("stale") else "缓存记录" if result.get("cached") else "更新"
     lines += ["", "🕒 "+label+"于 "+local_time(reading["finished_at"]), "查看历史：/电费 历史", "立即更新：/电费 刷新"]
@@ -94,6 +131,8 @@ def daily_brief_text(result, *, detail=False):
         if reading.get("subsidy_balance_yuan") is not None:lines += [f"补贴：{Decimal(reading['subsidy_balance_yuan']):.2f} 元"]
         if reading.get("meter_reading_kwh") is not None:lines += [f"累计电表读数：{Decimal(reading['meter_reading_kwh']):.2f} 度"]
         lines += [f"电价：{Decimal(reading['unit_price_yuan']):f} 元/度"]
+        brief_now = datetime.fromisoformat(brief["today"]).astimezone(BEIJING) if brief.get("today") else None
+        lines += energy_stats_lines(reading, now=brief_now)
     if estimate:lines += ["用电及电费为日读数差估算，不代表实际扣费。"]
     lines += ["查看历史：/电费 历史"]
     return "\n".join(lines)

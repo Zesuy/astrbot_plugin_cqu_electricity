@@ -67,7 +67,7 @@ class CquElectricityPlugin(Star):
         repo=Repository(self.data/"electricity.db")
         token_path=str(self.config.get("token_file","")).strip() or str(self.data/"auth.json")
         try:
-            client=ElectricityClient(token_path,session=self.config.get("session",""),scheme=self.config.get("query_scheme","https"),timeout=self.config.get("request_timeout",40),price=self.config.get("electricity_price","0.54"))
+            client=ElectricityClient(token_path,session=self.config.get("session",""),scheme=self.config.get("query_scheme","https"),timeout=self.config.get("request_timeout",40),price=self.config.get("electricity_price","0.54"),nh_enabled=self.config.get("shapingba_nh_enabled",True),nh_host=self.config.get("shapingba_nh_host","nh.cqu.edu.cn:26989"),nh_scheme=self.config.get("shapingba_nh_scheme","http"))
             self.service=ElectricityService(repo,client,cache_seconds=self.config.get("cache_seconds",60))
             self.actions=ElectricityActions(self.service,self.config)
             self.scheduler=Scheduler(self.service,self._allowed,self._send,capture_times=self.config.get("capture_times",["09:00","14:00"]),capture_window_minutes=self.config.get("capture_window_minutes",15),reminder_enabled=self.config.get("reminder_enabled",True))

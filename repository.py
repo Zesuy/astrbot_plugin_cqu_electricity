@@ -26,7 +26,9 @@ CREATE TABLE IF NOT EXISTS query_runs (
  CHECK(status IN ('running','success','failed','interrupted')),
  error_code TEXT, parser_version TEXT, cash_balance_yuan TEXT,
  subsidy_kwh TEXT, subsidy_balance_yuan TEXT, total_balance_yuan TEXT,
- meter_reading_kwh TEXT, unit_price_yuan TEXT);
+ meter_reading_kwh TEXT, unit_price_yuan TEXT,
+ today_kwh TEXT, today_cost_yuan TEXT, today_point TEXT,
+ monthly_kwh TEXT, monthly_cost_yuan TEXT, monthly_name TEXT);
 CREATE TABLE IF NOT EXISTS query_responses (
  id INTEGER PRIMARY KEY, query_id INTEGER NOT NULL REFERENCES query_runs(id),
  sequence_no INTEGER NOT NULL, stage TEXT NOT NULL, received_at TEXT NOT NULL,
@@ -89,6 +91,10 @@ class Repository:
                 self.db.execute("ALTER TABLE subscriptions ADD COLUMN reminder_type TEXT NOT NULL DEFAULT 'balance' CHECK(reminder_type IN ('balance','days'))")
             if "days_threshold" not in columns:
                 self.db.execute("ALTER TABLE subscriptions ADD COLUMN days_threshold TEXT")
+            run_cols = {r[1] for r in self.db.execute("PRAGMA table_info(query_runs)")}
+            for col in ("today_kwh", "today_cost_yuan", "today_point", "monthly_kwh", "monthly_cost_yuan", "monthly_name"):
+                if col not in run_cols:
+                    self.db.execute(f"ALTER TABLE query_runs ADD COLUMN {col} TEXT")
             self.db.execute("PRAGMA user_version=5")
             if recover:
                 self.db.execute("UPDATE query_runs SET status='interrupted',error_code='INTERRUPTED',finished_at=? WHERE status='running'", (utc_now(),))

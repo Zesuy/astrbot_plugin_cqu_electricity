@@ -72,7 +72,9 @@ def utc_now():
 
 
 def decimal_text(value):
-    return None if value is None else format(value, "f")
+    if value is None: return None
+    if isinstance(value, Decimal): return format(value, "f")
+    return str(value)
 
 
 def number(value):
@@ -144,6 +146,12 @@ class Reading:
     meter_reading_kwh: Decimal | None = None
     unit_price_yuan: Decimal = Decimal("0.54")
     resolved_building: str | None = None
+    today_kwh: Decimal | None = None
+    today_cost_yuan: Decimal | None = None
+    today_point: str | None = None
+    monthly_kwh: Decimal | None = None
+    monthly_cost_yuan: Decimal | None = None
+    monthly_name: str | None = None
 
     def fields(self):
         result = {k: decimal_text(v) for k, v in asdict(self).items() if k!="resolved_building"}
